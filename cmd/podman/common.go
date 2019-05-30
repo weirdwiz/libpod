@@ -540,6 +540,9 @@ func getCreateFlags(c *cliconfig.PodmanCommand) {
 		"workdir", "w", "",
 		"Working directory inside the container",
 	)
+	createFlags.Bool(
+		"generate-seccomp", false, "Generate seccomp for the container"
+	)
 }
 
 func getFormat(c *cliconfig.PodmanCommand) (string, error) {
