@@ -60,6 +60,7 @@ require (
 	github.com/hashicorp/go-multierror v1.0.0
 	github.com/hpcloud/tail v1.0.0
 	github.com/imdario/mergo v0.3.7 // indirect
+	github.com/iovisor/gobpf v0.0.0-20190329163444-e0d8d785d368
 	github.com/ishidawataru/sctp v0.0.0-20180213033435-07191f837fed // indirect
 	github.com/json-iterator/go v1.1.6
 	github.com/kisielk/errcheck v1.2.0 // indirect
@@ -94,7 +95,7 @@ require (
 	github.com/prometheus/common v0.6.0 // indirect
 	github.com/rogpeppe/fastuuid v1.1.0 // indirect
 	github.com/seccomp/containers-golang v0.0.0-20190312124753-8ca8945ccf5f // indirect
-	github.com/seccomp/libseccomp-golang v0.9.1 // indirect
+	github.com/seccomp/libseccomp-golang v0.9.1
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v0.0.5
 	github.com/spf13/jwalterweatherman v1.1.0 // indirect
