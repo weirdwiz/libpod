@@ -29,6 +29,7 @@ import (
 	"github.com/containers/libpod/pkg/systemdgen"
 	"github.com/containers/psgo"
 	"github.com/containers/storage"
+	"github.com/coreos/go-systemd/sdjournal"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -322,20 +323,19 @@ func (r *LocalRuntime) CreateContainer(ctx context.Context, c *cliconfig.CreateV
 
 // Run a libpod container
 func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode int) (int, error) {
+	startTime := time.Now()
 	results := shared.NewIntermediateLayer(&c.PodmanCommand, false)
 
 	ctr, createConfig, err := shared.CreateContainer(ctx, &results, r.Runtime)
 	if err != nil {
 		return exitCode, err
 	}
-
 	if logrus.GetLevel() == logrus.DebugLevel {
 		cgroupPath, err := ctr.CGroupPath()
 		if err == nil {
 			logrus.Debugf("container %q has CgroupParent %q", ctr.ID(), cgroupPath)
 		}
 	}
-
 	// Handle detached start
 	if createConfig.Detach {
 		// if the container was created as part of a pod, also start its dependencies, if any.
@@ -402,9 +402,9 @@ func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode
 		if errors.Cause(err) == define.ErrDetach {
 			exitCode = 0
 			return exitCode, nil
+			// This means the command did not exist
+			exitCode = 127
 		}
-		// This means the command did not exist
-		exitCode = 127
 		if strings.Index(err.Error(), "permission denied") > -1 {
 			exitCode = 126
 		}
@@ -430,6 +430,67 @@ func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode
 		}
 	} else {
 		exitCode = int(ecode)
+	}
+
+	if c.IsSet("generate-seccomp") {
+		fmt.Println("REACASD")
+		pid, err := ctr.PID()
+		if err != nil {
+			logrus.Errorf("Cannot get container's PID")
+		}
+		j, err := sdjournal.NewJournal()
+		if err != nil {
+			logrus.Errorf("Cannot get journal instance")
+		}
+		defer j.Close()
+		auditType := sdjournal.Match{Field: "_AUDIT_TYPE_NAME", Value: "SECCOMP"}
+		auditPID := sdjournal.Match{Field: "_PID", Value: strconv.FormatInt(int64(pid), 10)}
+		if err := j.AddMatch(auditType.String()); err != nil {
+			logrus.Error("failed to add filter for audit type")
+			return exitCode, err
+		}
+		if err := j.AddConjunction(); err != nil {
+			logrus.Error("failed to add conjunction to the filters")
+		}
+		if err := j.AddMatch(auditPID.String()); err != nil {
+			logrus.Error("failed to add filter for container PID")
+			return exitCode, err
+		}
+		if err := j.SeekRealtimeUsec(uint64(startTime.UnixNano() / 1000)); err != nil {
+			logrus.Error("failed to seek end of journal")
+			return exitCode, err
+		}
+		if _, err := j.Next(); err != nil {
+			fmt.Println(1)
+			return exitCode, err
+		}
+		prevCursor, err := j.GetCursor()
+		if err != nil {
+			fmt.Println(2)
+			return exitCode, err
+		}
+		for {
+			if _, err := j.Next(); err != nil {
+				fmt.Println(3)
+				return exitCode, err
+			}
+			newCursor, err := j.GetCursor()
+			if err != nil {
+				fmt.Println(4)
+				return exitCode, err
+			}
+			if prevCursor == newCursor {
+				_ = j.Wait(sdjournal.IndefiniteWait) //nolint
+				continue
+			}
+			prevCursor = newCursor
+			entry, err := j.GetEntry()
+			if err != nil {
+				fmt.Println(5)
+				return exitCode, err
+			}
+			fmt.Println(entry)
+		}
 	}
 
 	if c.IsSet("rm") {
