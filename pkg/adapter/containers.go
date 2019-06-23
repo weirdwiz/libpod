@@ -3,18 +3,25 @@
 package adapter
 
 import (
+	"C"
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
+
+	bpf "github.com/iovisor/gobpf/bcc"
 
 	"github.com/containers/buildah"
 	"github.com/containers/image/manifest"
@@ -29,10 +36,16 @@ import (
 	"github.com/containers/libpod/pkg/systemdgen"
 	"github.com/containers/psgo"
 	"github.com/containers/storage"
-	"github.com/coreos/go-systemd/sdjournal"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
+
+type event struct {
+	Pid uint32
+	Id  uint32
+	// Inum    uint
+	Command [16]byte
+}
 
 // GetLatestContainer gets the latest Container and wraps it in an adapter Container
 func (r *LocalRuntime) GetLatestContainer() (*Container, error) {
@@ -323,7 +336,6 @@ func (r *LocalRuntime) CreateContainer(ctx context.Context, c *cliconfig.CreateV
 
 // Run a libpod container
 func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode int) (int, error) {
-	startTime := time.Now()
 	results := shared.NewIntermediateLayer(&c.PodmanCommand, false)
 
 	ctr, createConfig, err := shared.CreateContainer(ctx, &results, r.Runtime)
@@ -415,7 +427,98 @@ func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode
 		}
 		return exitCode, err
 	}
+	if c.IsSet("generate-seccomp") {
+		fmt.Println("REACASD")
+		pid, err := ctr.PID()
+		if err != nil {
+			logrus.Errorf("Cannot get container's PID")
+		}
+		source := `
+#include <linux/bpf.h>
+#include <linux/nsproxy.h>
+#include <linux/pid_namespace.h>
+#include <linux/ns_common.h>
+#include <linux/sched.h>
+#include <linux/tracepoint.h>
 
+BPF_HASH(parent_namespace, u64,unsigned int);
+BPF_PERF_OUTPUT(events);
+
+struct data_t {
+	u32 pid;
+	u32 id;
+	char comm[16];
+};
+
+int enter_trace(struct tracepoint__raw_syscalls__sys_enter *args){
+	struct data_t data = {};
+	u64 key = 0;
+	unsigned int zero = 0;
+	struct task_struct *task;
+
+	data.pid = bpf_get_current_pid_tgid();
+	data.id = (int)args->id;
+	bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+	task = (struct task_struct *)bpf_get_current_task();
+    struct nsproxy* ns = task->nsproxy;
+    unsigned int inum = ns->pid_ns_for_children->ns.inum;
+
+
+    if (data.pid == PARENT_PID){
+        parent_namespace.update(&key, &inum);
+    } 
+    unsigned int* parent_inum = parent_namespace.lookup_or_init(&key, &zero);
+    
+	if (*parent_inum != inum){
+		return 0;
+	}
+
+	events.perf_submit(args, &data, sizeof(data));	
+    return 0;
+}
+`
+		src := strings.Replace(source, "PARENT_PID", strconv.Itoa(pid), -1)
+		fmt.Println(src)
+		m := bpf.NewModule(src, []string{})
+		defer m.Close()
+
+		tracepoint, err := m.LoadTracepoint("enter_trace")
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		if err := m.AttachTracepoint("raw_syscalls:sys_enter", tracepoint); err != nil {
+			fmt.Println("unable to load tracepoint")
+		}
+
+		table := bpf.NewTable(m.TableId("events"), m)
+		channel := make(chan []byte)
+		perfMap, err := bpf.InitPerfMap(table, channel)
+		if err != nil {
+			fmt.Println("unable to init perf map")
+		}
+
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, os.Kill)
+
+		go func() {
+			var e event
+			for {
+				data := <-channel
+				err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e)
+				if err != nil {
+					fmt.Printf("failed to decode received data '%s': %s\n", data, err)
+					continue
+				}
+				comm := (*C.char)(unsafe.Pointer(&e.Command))
+				fmt.Printf("Pid : %d, Syscall_ID : %d, , Command : %q", e.Pid, e.Id, C.GoString(comm))
+			}
+		}()
+		perfMap.Start()
+		<-sig
+		perfMap.Stop()
+	}
 	if ecode, err := ctr.Wait(); err != nil {
 		if errors.Cause(err) == define.ErrNoSuchCtr {
 			// The container may have been removed
@@ -430,67 +533,6 @@ func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode
 		}
 	} else {
 		exitCode = int(ecode)
-	}
-
-	if c.IsSet("generate-seccomp") {
-		fmt.Println("REACASD")
-		pid, err := ctr.PID()
-		if err != nil {
-			logrus.Errorf("Cannot get container's PID")
-		}
-		j, err := sdjournal.NewJournal()
-		if err != nil {
-			logrus.Errorf("Cannot get journal instance")
-		}
-		defer j.Close()
-		auditType := sdjournal.Match{Field: "_AUDIT_TYPE_NAME", Value: "SECCOMP"}
-		auditPID := sdjournal.Match{Field: "_PID", Value: strconv.FormatInt(int64(pid), 10)}
-		if err := j.AddMatch(auditType.String()); err != nil {
-			logrus.Error("failed to add filter for audit type")
-			return exitCode, err
-		}
-		if err := j.AddConjunction(); err != nil {
-			logrus.Error("failed to add conjunction to the filters")
-		}
-		if err := j.AddMatch(auditPID.String()); err != nil {
-			logrus.Error("failed to add filter for container PID")
-			return exitCode, err
-		}
-		if err := j.SeekRealtimeUsec(uint64(startTime.UnixNano() / 1000)); err != nil {
-			logrus.Error("failed to seek end of journal")
-			return exitCode, err
-		}
-		if _, err := j.Next(); err != nil {
-			fmt.Println(1)
-			return exitCode, err
-		}
-		prevCursor, err := j.GetCursor()
-		if err != nil {
-			fmt.Println(2)
-			return exitCode, err
-		}
-		for {
-			if _, err := j.Next(); err != nil {
-				fmt.Println(3)
-				return exitCode, err
-			}
-			newCursor, err := j.GetCursor()
-			if err != nil {
-				fmt.Println(4)
-				return exitCode, err
-			}
-			if prevCursor == newCursor {
-				_ = j.Wait(sdjournal.IndefiniteWait) //nolint
-				continue
-			}
-			prevCursor = newCursor
-			entry, err := j.GetEntry()
-			if err != nil {
-				fmt.Println(5)
-				return exitCode, err
-			}
-			fmt.Println(entry)
-		}
 	}
 
 	if c.IsSet("rm") {
