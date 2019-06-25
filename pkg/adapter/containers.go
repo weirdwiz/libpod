@@ -5,23 +5,17 @@ package adapter
 import (
 	"C"
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
-
-	bpf "github.com/iovisor/gobpf/bcc"
 
 	"github.com/containers/buildah"
 	"github.com/containers/image/manifest"
@@ -32,6 +26,7 @@ import (
 	"github.com/containers/libpod/libpod/define"
 	"github.com/containers/libpod/libpod/image"
 	"github.com/containers/libpod/libpod/logs"
+	genSeccomp "github.com/containers/libpod/libpod/seccomp"
 	"github.com/containers/libpod/pkg/adapter/shortcuts"
 	"github.com/containers/libpod/pkg/systemdgen"
 	"github.com/containers/psgo"
@@ -39,13 +34,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
-
-type event struct {
-	Pid uint32
-	Id  uint32
-	// Inum    uint
-	Command [16]byte
-}
 
 // GetLatestContainer gets the latest Container and wraps it in an adapter Container
 func (r *LocalRuntime) GetLatestContainer() (*Container, error) {
@@ -339,6 +327,12 @@ func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode
 	results := shared.NewIntermediateLayer(&c.PodmanCommand, false)
 
 	ctr, createConfig, err := shared.CreateContainer(ctx, &results, r.Runtime)
+	done := make(chan bool)
+	if c.IsSet("generate-seccomp") {
+		fileName := c.String("generate-seccomp")
+		go genSeccomp.Start(ctr, fileName, done)
+	}
+
 	if err != nil {
 		return exitCode, err
 	}
@@ -427,98 +421,7 @@ func (r *LocalRuntime) Run(ctx context.Context, c *cliconfig.RunValues, exitCode
 		}
 		return exitCode, err
 	}
-	if c.IsSet("generate-seccomp") {
-		fmt.Println("REACASD")
-		pid, err := ctr.PID()
-		if err != nil {
-			logrus.Errorf("Cannot get container's PID")
-		}
-		source := `
-#include <linux/bpf.h>
-#include <linux/nsproxy.h>
-#include <linux/pid_namespace.h>
-#include <linux/ns_common.h>
-#include <linux/sched.h>
-#include <linux/tracepoint.h>
 
-BPF_HASH(parent_namespace, u64,unsigned int);
-BPF_PERF_OUTPUT(events);
-
-struct data_t {
-	u32 pid;
-	u32 id;
-	char comm[16];
-};
-
-int enter_trace(struct tracepoint__raw_syscalls__sys_enter *args){
-	struct data_t data = {};
-	u64 key = 0;
-	unsigned int zero = 0;
-	struct task_struct *task;
-
-	data.pid = bpf_get_current_pid_tgid();
-	data.id = (int)args->id;
-	bpf_get_current_comm(&data.comm, sizeof(data.comm));
-
-	task = (struct task_struct *)bpf_get_current_task();
-    struct nsproxy* ns = task->nsproxy;
-    unsigned int inum = ns->pid_ns_for_children->ns.inum;
-
-
-    if (data.pid == PARENT_PID){
-        parent_namespace.update(&key, &inum);
-    } 
-    unsigned int* parent_inum = parent_namespace.lookup_or_init(&key, &zero);
-    
-	if (*parent_inum != inum){
-		return 0;
-	}
-
-	events.perf_submit(args, &data, sizeof(data));	
-    return 0;
-}
-`
-		src := strings.Replace(source, "PARENT_PID", strconv.Itoa(pid), -1)
-		fmt.Println(src)
-		m := bpf.NewModule(src, []string{})
-		defer m.Close()
-
-		tracepoint, err := m.LoadTracepoint("enter_trace")
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		if err := m.AttachTracepoint("raw_syscalls:sys_enter", tracepoint); err != nil {
-			fmt.Println("unable to load tracepoint")
-		}
-
-		table := bpf.NewTable(m.TableId("events"), m)
-		channel := make(chan []byte)
-		perfMap, err := bpf.InitPerfMap(table, channel)
-		if err != nil {
-			fmt.Println("unable to init perf map")
-		}
-
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, os.Kill)
-
-		go func() {
-			var e event
-			for {
-				data := <-channel
-				err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e)
-				if err != nil {
-					fmt.Printf("failed to decode received data '%s': %s\n", data, err)
-					continue
-				}
-				comm := (*C.char)(unsafe.Pointer(&e.Command))
-				fmt.Printf("Pid : %d, Syscall_ID : %d, , Command : %q", e.Pid, e.Id, C.GoString(comm))
-			}
-		}()
-		perfMap.Start()
-		<-sig
-		perfMap.Stop()
-	}
 	if ecode, err := ctr.Wait(); err != nil {
 		if errors.Cause(err) == define.ErrNoSuchCtr {
 			// The container may have been removed
@@ -540,7 +443,8 @@ int enter_trace(struct tracepoint__raw_syscalls__sys_enter *args){
 			logrus.Errorf("Error removing container %s: %v", ctr.ID(), err)
 		}
 	}
-
+	done <- true
+	time.Sleep(2 * time.Second)
 	return exitCode, nil
 }
 
